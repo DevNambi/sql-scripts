@@ -1,0 +1,53 @@
+SELECT        TOP 40
+              [Statement Running]        = CASE ER.[statement_end_offset] WHEN -1 THEN SUBSTRING(EST.TEXT, (ER.[statement_start_offset]/2) + 1, 2147483647) ELSE SUBSTRING(EST.TEXT,(ER.[statement_start_offset]/2) + 1, (ER.[statement_end_offset] - ER.[statement_start_offset])/2) END,
+              [SQL Statement]            = RTRIM(LTRIM(EST.text)), -- Last T-SQL Text
+              [SPID]                     = ES.Session_ID,
+              [BlkBy]                    = TL.BlkBy,
+              [CPU (ms)]                 = ISNULL(ER.cpu_time, ES.cpu_time),
+              [Disk I/O]                 = ISNULL((ER.reads + ER.writes),(ES.reads + ES.writes)),
+              [%Complete]                = CONVERT(NUMERIC(6,2), ER.percent_complete),
+              [Elapsed Min]              = CONVERT(NUMERIC(10,2), ER.total_elapsed_time / 1000.0 / 60.0),
+              [ETA]                      = CONVERT(VARCHAR(20), DATEADD(ms, ER.estimated_completion_time, GetDate()),20),
+              [ETA Min]                  = CONVERT(NUMERIC(10,2), ER.estimated_completion_time / 1000.0 / 60.0),
+              [ETA Hours]                = CONVERT(NUMERIC(10,2), ER.estimated_completion_time / 1000.0 / 60.0 / 60.0),
+              [Wait Type]                = ER.wait_type,
+              [Wait Resource]            = ER.wait_resource,
+              [Status]                   = UPPER(ISNULL(ER.[status], ES.[status])),
+              [Hostname]                 = UPPER(ES.[host_name]),
+              [Database]                 = DB_NAME(ISNULL(ER.database_id, ES.database_id)),
+              [Program Name]             = ES.[program_name],
+              [Login]                    = ES.login_name,
+              [Login Time]               = SP.login_time,
+              [Last Batch]               = ES.last_request_start_time,
+              [Client IP]                = DMEC.client_net_address,
+              [Client Port]              = DMEC.client_tcp_port,          
+              [Last Wait Type]           = SP.lastwaittype,
+              [Command]                  = ER.command,
+              [Protocol]                 = DMEC.protocol_type,
+              [Auth]                     = DMEC.auth_scheme,
+              [Query Plan]               = QP.query_plan,
+              [Tran Open?]               = SP.open_tran,
+              [Tran SessionID]           = DTST.session_id,
+              [Tran Begin]               = DTDT.database_transaction_begin_time,
+              [Tran Log Records]         = DTDT.database_transaction_log_record_count,
+              [Tran Log Bytes]           = DTDT.database_transaction_log_bytes_used,
+              [Tran Log Reserved]        = DTDT.database_transaction_log_bytes_reserved
+FROM sys.dm_exec_sessions                                     AS ES        
+       LEFT OUTER JOIN sys.dm_tran_session_transactions       AS DTST ON ES.session_id = DTST.session_id
+       LEFT OUTER JOIN sys.dm_tran_database_transactions      AS DTDT ON DTDT.transaction_id = DTST.transaction_id
+       LEFT OUTER JOIN sys.dm_exec_requests                   AS ER ON es.session_id = er.session_id
+       LEFT OUTER JOIN sys.sysprocesses                       AS SP ON sp.spid = es.session_id
+       LEFT OUTER JOIN sys.dm_exec_connections                AS DMEC ON dmec.session_id = es.session_id
+       LEFT OUTER JOIN
+                     (      
+                        SELECT SPID = A.request_session_id,
+                               BlkBy = B.blocking_session_id
+                        FROM sys.dm_tran_locks AS A
+                          INNER JOIN sys.dm_os_waiting_tasks AS B ON A.lock_owner_address = B.resource_address
+                     ) AS TL ON es.Session_ID = tl.SPID
+       OUTER APPLY sys.dm_exec_sql_text(SP.[sql_handle])      AS EST
+       OUTER APPLY sys.dm_exec_query_plan(ER.plan_handle)     AS QP
+WHERE ES.Session_ID <> @@SPID
+       AND ES.[host_name] IS NOT NULL
+       AND DB_NAME(ISNULL(ER.database_id, ES.database_id)) NOT IN ('msdb','master')
+ORDER BY ER.command DESC, SP.last_batch DESC, ES.nt_user_name DESC;
