@@ -1,0 +1,165 @@
+-- Database Drives: View which drives your databases live on
+---------------------------------------------------------------
+
+IF OBJECT_ID('tempdb.dbo.#dbDrives','U') IS NOT NULL DROP TABLE #dbDrives;
+    CREATE TABLE #dbDrives(database_name SYSNAME, database_drive VARCHAR(10));
+        INSERT INTO #dbDrives EXECUTE sp_msforeachdb 'Use ?; Select distinct DB_NAME(DB_ID()) AS ''database'', SubString(physical_name, 1, 3) FROM sys.database_files;';
+        SELECT Drive = RTRIM(database_drive), [Database] = database_name FROM #dbDrives ORDER BY database_drive, database_name;
+            DROP TABLE #dbDrives;
+ 
+ 
+-- Space Used By Drive (Requires xp_cmdshell)
+---------------------------------------------------------------
+
+IF OBJECT_ID('tempdb.dbo.#driveSpace','U') IS NOT NULL
+    DROP TABLE #driveSpace;
+        CREATE TABLE #driveSpace(line NVARCHAR(255));
+ 
+DECLARE @SQL VARCHAR(400) = 'powershell.exe "Get-WmiObject -ComputerName ' + QUOTENAME(@@SERVERNAME,'''')+' -Class Win32_Volume -Filter ''DriveType = 3'' | select name,capacity,freespace | foreach{$_.name+''|''+$_.capacity/1048576+''%''+$_.freespace/1048576+''*''}"';
+ 
+INSERT INTO #driveSpace
+EXECUTE xp_cmdshell @SQL;
+ 
+SELECT [Drive] = RTRIM(LTRIM(SUBSTRING(line,1,CHARINDEX('|',line)-1))),
+              ROUND(CAST(RTRIM(LTRIM(SUBSTRING(line,CHARINDEX('|',line)+1,
+              (CHARINDEX('%',line) -1)-CHARINDEX('|',line)))) AS FLOAT),0) AS 'Capacity(MB)',
+              ROUND(CAST(RTRIM(LTRIM(SUBSTRING(line,CHARINDEX('%',line)+1,
+              (CHARINDEX('*',line) -1)-CHARINDEX('%',line)))) AS FLOAT),0) AS 'Freespace(MB)',
+              ROUND(CAST(RTRIM(LTRIM(SUBSTRING(line,CHARINDEX('|',line)+1,
+              (CHARINDEX('%',line) -1)-CHARINDEX('|',line)))) AS FLOAT)/1024,0) AS 'Capacity(GB)',
+              ROUND(CAST(RTRIM(LTRIM(SUBSTRING(line,CHARINDEX('%',line)+1,
+              (CHARINDEX('*',line) -1)-CHARINDEX('%',line)))) AS FLOAT)/1024,0) AS 'Freespace(GB)'
+FROM #driveSpace
+WHERE line LIKE '[A-Z][:]%' ORDER BY drive;
+DROP TABLE #driveSpace;
+ 
+ 
+-- Space Used By Table
+---------------------------------------------------------------
+DECLARE @SQL1 NVARCHAR(MAX);
+ 
+IF OBJECT_ID('tempdb.dbo.#tableSpace','U') IS NOT NULL
+    DROP TABLE #tableSpace
+        CREATE TABLE #tableSpace(
+               TableName VARCHAR(128),
+               [Rows] VARCHAR(11),
+               Reserved VARCHAR(18),
+               Used VARCHAR(18),
+               IndexSize VARCHAR(18),
+               Unused VARCHAR(18));
+ 
+DECLARE @TABLENAME VARCHAR(255)
+DECLARE TABLENAMECURSOR CURSOR FAST_FORWARD FOR
+       SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE' AND TABLE_SCHEMA = 'dbo'
+              OPEN TABLENAMECURSOR
+ 
+                     FETCH NEXT FROM TABLENAMECURSOR INTO @TABLENAME
+                           WHILE @@FETCH_STATUS = 0 BEGIN
+                           SELECT @SQL1 = 'EXEC ..sp_executesql N''INSERT INTO #tableSpace EXEC sp_spaceused ' + @TABLENAME + ''''
+                           EXEC(@SQL1)
+                     FETCH NEXT FROM TABLENAMECURSOR INTO @TABLENAME
+              END
+       CLOSE TABLENAMECURSOR
+       DEALLOCATE TABLENAMECURSOR
+ 
+SELECT *
+FROM #tableSpace
+ORDER BY LEN([Rows]) DESC;
+ 
+DROP TABLE #tableSpace;
+ 
+ 
+-- Space Used by Log File
+---------------------------------------------------------------
+DECLARE @sqlcmd NVARCHAR(4000), @ByteMb DECIMAL(12,1) = 1024*1024         
+             
+IF OBJECT_ID('tempdb..#LogInfo') IS NOT NULL DROP TABLE #LogInfo
+CREATE TABLE #LogInfo(
+    RecoveryUnitID INT,
+       DatabaseName sysname DEFAULT(DB_NAME()),
+       FileID BIGINT,
+       FileSize BIGINT,
+       StartOffset BIGINT,
+       FSeqNo BIGINT,
+       Status INT,
+       Parity SMALLINT,
+       CreatedLSN NUMERIC(38))
+ 
+SET @sqlcmd = 'use [?] insert into #LogInfo (RecoveryUnitID, FileID, FileSize, StartOffset, FSeqNo, Status, Parity, CreatedLSN) EXEC (''DBCC LOGINFO'')'
+EXEC sp_MsForEachDb @sqlcmd
+ 
+IF OBJECT_ID('tempdb..#OpenTran') IS NOT NULL DROP TABLE #OpenTran
+CREATE TABLE #OpenTran(
+       DatabaseName sysname DEFAULT(DB_NAME()),
+       Defn VARCHAR(25),
+       Details SQL_VARIANT)
+ 
+SET @sqlcmd = 'use [?] insert into #OpenTran (Defn , Details ) EXEC (''DBCC OPENTRAN WITH TABLERESULTS, NO_INFOMSGS'')'
+EXEC sp_MsForEachDb @sqlcmd
+ 
+IF OBJECT_ID('tempdb..#ALL_DB_Files') IS NOT NULL DROP TABLE #ALL_DB_Files
+CREATE TABLE #ALL_DB_Files(
+    dbname SYSNAME,
+    fileid SMALLINT,
+    groupid SMALLINT,
+    [size] INT NOT NULL,
+    [maxsize] INT NOT NULL,
+    growth INT NOT NULL,
+    [status] INT,
+    perf INT,
+    [name] SYSNAME NOT NULL,
+    [filename] NVARCHAR(260) NOT NULL)
+ 
+EXEC sp_MsForEachDB @command1 = 'use [$];Insert into #ALL_DB_Files select db_name(), * from sysfiles', @replacechar = '$'       
+ 
+SELECT [SQLServerName] = @@SERVERNAME,
+              [Database] = l.DatabaseName,
+              [dbFileLogicalName] = adf.name,
+              adf.[filename] AS 'dbFilePhysicalFilePath',
+              LEFT(RIGHT((l.LogUsedMb / LogSizeMb), (LEN((l.LogUsedMb / LogSizeMb)) - 2)), 2) + '.' + LEFT(RIGHT((l.LogUsedMb / LogSizeMb), (LEN((l.LogUsedMb / LogSizeMb)) - 4)), 2) + ' %' AS 'LogUsedPct',
+              LEFT(l.LogSizeMB, (CHARINDEX('.', l.LogSizeMB) + 2)) AS 'LogSizeMB',
+              LEFT(l.LogUsedMb, (CHARINDEX('.', l.LogUsedMb) + 2)) AS 'LogUsedMB',      
+              COALESCE(af.MaxRestrictedSpaceLeftMB, -1) AS 'MaxRestrictedSpaceLeftMB',
+              COALESCE(af.MaxRestrictedPercentFree, -1) AS 'MaxRestrictedPercentFree',
+              l.VirtualLogCnt,
+        l.VirtualLogActiveCnt,
+        CASE WHEN O.DatabaseName IS NOT NULL THEN 'Y' ELSE 'N' END AS 'DatabaseOpenTran',
+        [Shrink Log File Statement] = CASE WHEN adf.[filename] LIKE '%:\SQL_LOGS\%.ldf' THEN '-- DBCC SHRINKFILE (' + adf.name + ', 1)' ELSE '' END
+FROM ( SELECT DatabaseName,
+                           SUM(FileSize ) / @ByteMb AS 'LogSizeMB',
+                           SUM(CASE STATUS WHEN 2 THEN FileSize ELSE 0.0 END) / @ByteMb AS 'LogUsedMB',
+                           COUNT(*) AS 'VirtualLogCnt',
+                           SUM(CASE STATUS WHEN 2 THEN 1 ELSE 0 END) AS 'VirtualLogActiveCnt'
+              FROM #LogInfo
+              GROUP BY DatabaseName) AS l
+       INNER JOIN #ALL_DB_Files AS adf
+              ON adf.dbname = l.DataBaseName
+       LEFT OUTER JOIN (SELECT DISTINCT DatabaseName FROM #OpenTran) AS o
+              ON o.DatabaseName = l.DatabaseName
+       LEFT OUTER JOIN (SELECT    ROUND(maxsize * CONVERT(FLOAT,8) / 1024, 0) - ROUND(size * CONVERT(FLOAT,8) / 1024, 0) AS 'MaxRestrictedSpaceLeftMB',
+                                                (ROUND(maxsize * CONVERT(FLOAT,8) / 1024, 0) - ROUND(size * CONVERT(FLOAT,8) / 1024, 0)) / (ROUND(maxsize * CONVERT(FLOAT,8) / 1024, 0)) * 100 AS 'MaxRestrictedPercentFree',
+                                                dbname,[filename],[name] FROM #ALL_DB_Files WHERE maxsize > -1) AS af ON af.dbname = l.DataBaseName
+ORDER BY LEFT(RIGHT((l.LogUsedMb / LogSizeMb), (LEN((l.LogUsedMb / LogSizeMb)) - 2)), 2) + '.' + LEFT(RIGHT((l.LogUsedMb / LogSizeMb), (LEN((l.LogUsedMb / LogSizeMb)) - 4)), 2) DESC;
+ 
+ 
+-- Log file size in KB & Other Goodies (I use this most often while babysitting index rebuilds)
+---------------------------------------------------------------
+SELECT  [Database] = A.instance_name,
+        [Data File Size (KB)] = D.cntr_value,
+        [Log File Size (KB)] = A.cntr_value,
+        [Log File Space Used (KB)] = B.cntr_value,
+        [Available Log File (KB)] = CAST(A.cntr_value AS NUMERIC)-CAST(B.cntr_value AS NUMERIC),
+        [Percent Log Used] = CONVERT(VARCHAR,C.cntr_value) + '%'            
+FROM (
+        SELECT instance_name, cntr_value FROM sys.dm_os_performance_counters
+        WHERE counter_name = 'Log File(s) Size (KB)') AS A
+           INNER JOIN (
+            SELECT instance_name, cntr_value FROM sys.dm_os_performance_counters
+            WHERE counter_name = 'Log File(s) Used Size (KB)') AS B ON A.instance_name = B.instance_name
+               LEFT OUTER JOIN (
+                SELECT instance_name, cntr_value FROM sys.dm_os_performance_counters
+                WHERE counter_name = 'Percent Log Used') AS C ON A.instance_name = C.instance_name
+                   INNER JOIN (
+                    SELECT instance_name, cntr_value FROM sys.dm_os_performance_counters
+                    WHERE counter_name = 'Data File(s) Size (KB)') AS D ON A.instance_name = D.instance_name
+ORDER BY C.cntr_value DESC;
